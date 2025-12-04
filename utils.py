@@ -62,3 +62,36 @@ def run_operation_unary(dim: int, operation: Callable) -> Callable:
     """Helper to create a closure for benchmarking unary ops (like GeLU)."""
     x = torch.randn(dim, dim, device=get_device())
     return lambda: operation(x)
+
+
+def matmul_check_equal(func1, func2, M, N, K):
+    """Checks if two functions produce the same output for MatMul."""
+    A = torch.randn(M, K, device=get_device())
+    B = torch.randn(K, N, device=get_device())
+
+    # Ensure MatMul input is contiguous for correct stride calculation
+    A = A.contiguous()
+    B = B.contiguous()
+    
+    try:
+        Y1 = func1(A, B)
+        Y2 = func2(A, B)
+    except Exception as e:
+        print(f"❌ Error during execution of {func1.__name__} or {func2.__name__}: {e}")
+        return
+
+    # MatMul tends to have higher deviation, so we use a slightly looser tolerance
+    if torch.allclose(Y1, Y2, atol=1e-2, rtol=1e-2):
+        print(f"✅ {func1.__name__} and {func2.__name__} match!")
+    else:
+        diff = (Y1 - Y2).abs().max()
+        print(f"❌ {func1.__name__} and {func2.__name__} mismatch! Max diff: {diff}")
+
+def run_operation_binary(M, N, K, operation: Callable) -> Callable:
+    """Helper to create a closure for benchmarking MatMul."""
+    A = torch.randn(M, K, device=get_device())
+    B = torch.randn(K, N, device=get_device())
+    # Ensure contiguous for fair benchmarking
+    A = A.contiguous()
+    B = B.contiguous()
+    return lambda: operation(A, B)
