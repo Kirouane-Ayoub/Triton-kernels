@@ -12,11 +12,13 @@ def pytorch_matmul(A, B):
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64}, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=4),
     ],
     key=["M", "N", "K"]
 )
@@ -29,12 +31,23 @@ def triton_matmul_kernel(
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     # ------------------------------------------------------------
-    # Program IDs
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    # Swizzled program ordering for L2 cache locality.
+    # Instead of a naive row-major grid, we group tiles so that
+    # nearby programs access overlapping rows/columns of A and B,
+    # improving L2 cache hit rates.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Tile ranges
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -69,16 +82,18 @@ def triton_matmul(A, B):
     assert A.ndim == 2 and B.ndim == 2
     assert A.shape[1] == B.shape[0]
 
+    A = A.contiguous()
+    B = B.contiguous()
+
     M, K = A.shape
     _, N = B.shape
 
     C = torch.empty((M, N), device=A.device, dtype=A.dtype)
 
-    # Grid: one program per C tile
+    # Grid: flat 1D grid (swizzle logic inside the kernel maps pid -> tile)
     def grid(meta):
         return (
-            triton.cdiv(M, meta['BLOCK_M']),
-            triton.cdiv(N, meta['BLOCK_N']),
+            triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),
         )
 
     triton_matmul_kernel[grid](
