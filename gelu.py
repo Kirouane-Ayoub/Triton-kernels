@@ -17,10 +17,11 @@ def pytorch_gelu(x):
 # 3. Triton Implementation
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
     ],
     key=['num_elements'],
 )
@@ -54,6 +55,7 @@ def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
 
 
 def triton_gelu(x):
+    assert x.is_cuda, "Input must be on CUDA device"
     x = x.contiguous()
     y = torch.empty_like(x)
 
