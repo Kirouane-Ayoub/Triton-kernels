@@ -1,18 +1,15 @@
-from utils import get_device, benchmark, check_equal
+from utils import get_device, benchmark, check_equal, run_operation_unary
 import torch
 import triton
 import triton.language as tl
-from typing import Callable
 
 
 def manual_relu(x):
-    return torch.maximum(x, torch.zeros_like(x))
+    return torch.clamp(x, min=0)
 
 
-def run_operation_unary(dim: int, operation: Callable) -> Callable:
-    """Helper to create a closure for benchmarking unary ops."""
-    x = torch.randn(dim, dim, device=get_device())
-    return lambda: operation(x)
+def pytorch_relu(x):
+    return torch.nn.functional.relu(x)
 
 # --- TRITON KERNEL ---
 
@@ -80,7 +77,8 @@ def benchmark_relu():
 
     # Run Benchmarks
     benchmark("1. Manual PyTorch ReLU", run_operation_unary(dim, manual_relu))
-    benchmark("2. Triton Custom ReLU ", run_operation_unary(dim, triton_relu))
+    benchmark("2. PyTorch Native ReLU", run_operation_unary(dim, pytorch_relu))
+    benchmark("3. Triton Custom ReLU ", run_operation_unary(dim, triton_relu))
 
 if __name__ == "__main__":
     benchmark_relu()
