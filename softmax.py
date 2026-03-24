@@ -16,71 +16,55 @@ def pytorch_softmax(x):
     return torch.nn.functional.softmax(x, dim=-1)
 
 
-# 3. Triton Softmax
+# 3. Triton Softmax (Online algorithm — 2 passes instead of 3)
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
     ],
     key=['num_cols'],
 )
 @triton.jit
 def triton_softmax_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride, num_cols, BLOCK_SIZE: tl.constexpr):
     """
-    Chunked, numerically-stable softmax per row (one program per row).
-    - BLOCK_SIZE: number of lanes per block/program (autotuned)
+    Online softmax: fuses max and sum into a single pass over data.
+    Pass 1: compute max and denominator together (online algorithm).
+    Pass 2: normalize and write output.
+    This reads global memory 2x instead of 3x.
     """
     row_idx = tl.program_id(0)
+    row_start_x = x_ptr + row_idx * x_row_stride
+    row_start_y = y_ptr + row_idx * y_row_stride
     offs = tl.arange(0, BLOCK_SIZE)
 
-    # --- PASS 1: compute row-wise max (reduce over chunks) ---
-    # initialize accumulator to very small value
-    row_max = -1e9
-
-    # sweep over columns in chunks
-    for col_start in range(0, num_cols, BLOCK_SIZE):
-        col_idxs = col_start + offs
-        mask = col_idxs < num_cols
-
-        x_ptrs = x_ptr + row_idx * x_row_stride + col_idxs
-        # For max pass use a very negative "other" so masked lanes don't affect max.
-        x_chunk = tl.load(x_ptrs, mask=mask, other=-1e9)
-
-        # tl.max reduces across all lanes in the block for this vector and returns scalar
-        chunk_max = tl.max(x_chunk, axis=0)
-        row_max = tl.maximum(row_max, chunk_max)
-
-    # --- PASS 2: compute denominator (sum of exp(x - max)) ---
+    # --- PASS 1: online softmax — fused max + sum ---
+    # Track running max and a denominator that gets corrected on the fly.
+    row_max = -float('inf')
     denom = 0.0
+
     for col_start in range(0, num_cols, BLOCK_SIZE):
         col_idxs = col_start + offs
         mask = col_idxs < num_cols
+        x_chunk = tl.load(row_start_x + col_idxs, mask=mask, other=-float('inf'))
 
-        x_ptrs = x_ptr + row_idx * x_row_stride + col_idxs
-        x_chunk = tl.load(x_ptrs, mask=mask, other=0.0)   # other doesn't matter here; masked lanes are ignored by mask
+        # New max for this chunk
+        chunk_max = tl.max(x_chunk, axis=0)
+        new_max = tl.maximum(row_max, chunk_max)
 
-        # compute exp(x - max) in registers
-        # Using tl.exp is fine; libdevice.exp also possible
-        ex = tl.exp(x_chunk - row_max)
+        # Correct the running denominator for the new max, then add new terms.
+        # denom was sum(exp(x_i - old_max)), rescale to sum(exp(x_i - new_max))
+        denom = denom * tl.exp(row_max - new_max) + tl.sum(tl.exp(x_chunk - new_max), axis=0)
+        row_max = new_max
 
-        # sum across lanes in this block's vector
-        denom += tl.sum(ex, axis=0)
-
-    # denom is a scalar (sum over all chunks)
-    # --- PASS 3: final division and write result ---
+    # --- PASS 2: normalize and write ---
     for col_start in range(0, num_cols, BLOCK_SIZE):
         col_idxs = col_start + offs
         mask = col_idxs < num_cols
-
-        x_ptrs = x_ptr + row_idx * x_row_stride + col_idxs
-        y_ptrs = y_ptr + row_idx * y_row_stride + col_idxs
-
-        x_chunk = tl.load(x_ptrs, mask=mask, other=0.0)
-        ex = tl.exp(x_chunk - row_max)
-        out = ex / denom
-        tl.store(y_ptrs, out, mask=mask)
+        x_chunk = tl.load(row_start_x + col_idxs, mask=mask, other=-float('inf'))
+        out = tl.exp(x_chunk - row_max) / denom
+        tl.store(row_start_y + col_idxs, out, mask=mask)
 
 
 def triton_softmax(x: torch.Tensor) -> torch.Tensor:
